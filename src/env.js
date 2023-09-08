@@ -25,6 +25,7 @@
 import fs from 'fs';
 import path from 'path';
 import url from 'url';
+import { Buffer } from 'buffer';
 
 import { ONNX } from './backends/onnx.js';
 const { env: onnx_env } = ONNX;
@@ -32,15 +33,19 @@ const { env: onnx_env } = ONNX;
 const VERSION = '2.5.4';
 
 // Check if various APIs are available (depends on environment)
+const IS_REACT_NATIVE = typeof navigator !== 'undefined' && navigator.product === 'ReactNative';
 const WEB_CACHE_AVAILABLE = typeof self !== 'undefined' && 'caches' in self;
-const FS_AVAILABLE = !isEmpty(fs); // check if file system is available
+const FS_AVAILABLE = !isEmpty(fs) || IS_REACT_NATIVE; // check if file system is available
 const PATH_AVAILABLE = !isEmpty(path); // check if path is available
 
 const RUNNING_LOCALLY = FS_AVAILABLE && PATH_AVAILABLE;
 
-const __dirname = RUNNING_LOCALLY
-    ? path.dirname(path.dirname(url.fileURLToPath(import.meta.url)))
-    : './';
+let __dirname = './';
+if (IS_REACT_NATIVE) {
+    __dirname = fs.DocumentDirectoryPath;
+} else if (RUNNING_LOCALLY) {
+    __dirname = path.dirname(path.dirname(url.fileURLToPath(import.meta.url)));
+}
 
 // Only used for environments with access to file system
 const DEFAULT_CACHE_DIR = RUNNING_LOCALLY
@@ -91,6 +96,8 @@ export const env = {
 
         // TensorFlow.js
         tfjs: {},
+
+        Uint8Array: IS_REACT_NATIVE ? Buffer : Uint8Array,
     },
 
     __dirname,
@@ -104,6 +111,9 @@ export const env = {
     allowLocalModels: true,
     localModelPath: localModelPath,
     useFS: FS_AVAILABLE,
+
+    allowFallback: !IS_REACT_NATIVE,
+    useGCanvas: true,
 
     /////////////////// Cache settings ///////////////////
     useBrowserCache: WEB_CACHE_AVAILABLE,

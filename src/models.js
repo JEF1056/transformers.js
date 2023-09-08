@@ -77,9 +77,13 @@ import {
     Tensor,
 } from './utils/tensor.js';
 
+import { env } from './env.js';
+
 import { executionProviders, ONNX } from './backends/onnx.js';
 import { medianFilter, round } from './transformers.js';
 const { InferenceSession, Tensor: ONNXTensor } = ONNX;
+
+const IS_BROWSER = typeof navigator !== 'undefined' && navigator.product !== 'ReactNative';
 
 /**
  * @typedef {import('./utils/hub.js').PretrainedOptions} PretrainedOptions
@@ -140,7 +144,7 @@ async function constructSession(pretrained_model_name_or_path, fileName, options
         });
     } catch (err) {
         // If the execution provided was only wasm, throw the error
-        if (executionProviders.length === 1 && executionProviders[0] === 'wasm') {
+        if (!env.allowFallback || executionProviders.length === 1 && executionProviders[0] === 'wasm') {
             throw err;
         }
 
@@ -211,7 +215,14 @@ async function sessionRun(session, inputs) {
     } catch (e) {
         // This usually occurs when the inputs are of the wrong type.
         console.error(`An error occurred during model execution: "${e}".`);
-        console.error('Inputs given to model:', checkedInputs);
+        // Not log full data, it may cause crash in React Native
+        console.error(
+            'Inputs given to model:',
+            IS_BROWSER ? checkedInputs : Object.fromEntries(
+                Object.entries(checkedInputs)
+                    .map(([key, tensor]) => [key, { dims: tensor.dims, type: tensor.type }])
+            )
+        );
         throw e;
     }
 }

@@ -35,11 +35,15 @@ import {
 import { max, min, round } from './utils/maths.js';
 import { Tensor } from './utils/tensor.js';
 
+import { env } from './env.js';
+
 import {
     PriorityQueue,
     TokenLattice,
     CharTrie,
 } from './utils/data-structures.js';
+
+const { backends: { Uint8Array } } = env;
 
 /**
  * @typedef {import('./utils/hub.js').PretrainedOptions} PretrainedOptions
@@ -1731,7 +1735,7 @@ class ByteLevelDecoder extends Decoder {
     convert_tokens_to_string(tokens) {
         let text = tokens.join('');
 
-        let byteArray = new Uint8Array([...text].map(c => this.byte_decoder[c]));
+        let byteArray = Uint8Array.from([...text].map(c => this.byte_decoder[c]));
         let decoded_text = this.text_decoder.decode(byteArray);
         return decoded_text;
     }

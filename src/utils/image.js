@@ -8,19 +8,52 @@
  * @module utils/image
  */
 
+import fs from 'fs';
 import { isString } from './core.js';
 import { getFile } from './hub.js';
 import { env } from '../env.js';
+import { transpose_data, interpolate_data } from './maths.js';
+
+import encode from 'image-encode';
+import decode from 'image-decode';
+import { Buffer } from 'buffer';
 
 // Will be empty (or not used) if running in browser or web-worker
 import sharp from 'sharp';
 
 const BROWSER_ENV = typeof self !== 'undefined';
+const IS_REACT_NATIVE = typeof navigator !== 'undefined' && navigator.product === 'ReactNative';
 
 let createCanvasFunction;
 let ImageDataClass;
 let loadImageFunction;
-if (BROWSER_ENV) {
+if (IS_REACT_NATIVE) {
+    // Optional Support `@flyskywhy/react-native-browser-polyfill` for better performance
+    if (typeof document !== 'undefined' && typeof Image !== 'undefined') {
+        createCanvasFunction = (/** @type {number} */ width, /** @type {number} */ height) => {
+            const canvas = document.createElement('canvas');
+            canvas.width = width;
+            canvas.height = height;
+            return canvas;
+        };
+        loadImageFunction = async (/**@type {URL|string}*/url) => {
+            const info = await new Promise((resolve, reject) => {
+                const image = new Image();
+                image.onload = () => {
+                    const canvas = createCanvasFunction(image.width, image.height);
+                    const ctx = canvas.getContext('2d');
+                    ctx.drawImage(image, 0, 0);
+                    const { data } = ctx.getImageData(0, 0, image.width, image.height);
+                    resolve({ data, width: image.width, height: image.height });
+                }
+                image.onerror = reject;
+                image.src = url;
+            });
+            return new RawImage(info.data, info.width, info.height, 4);
+        };
+        ImageDataClass = global.ImageData;
+    }
+} else if (BROWSER_ENV) {
     // Running in browser or web-worker
     createCanvasFunction = (/** @type {number} */ width, /** @type {number} */ height) => {
         if (!self.OffscreenCanvas) {
@@ -120,12 +153,21 @@ export class RawImage {
      * @returns {Promise<RawImage>} The image object.
      */
     static async fromURL(url) {
-        let response = await getFile(url);
-        if (response.status !== 200) {
-            throw new Error(`Unable to read image from "${url}" (${response.status} ${response.statusText})`);
+        if (IS_REACT_NATIVE) {
+            if (env.useGCanvas && loadImageFunction) {
+                return await loadImageFunction(url);
+            } else {
+                let response = await getFile(url);
+                return this.fromBlob(response);
+            }
+        } else {
+            let response = await getFile(url);
+            if (response.status !== 200) {
+                throw new Error(`Unable to read image from "${url}" (${response.status} ${response.statusText})`);
+            }
+            let blob = await response.blob();
+            return this.fromBlob(blob);
         }
-        let blob = await response.blob();
-        return this.fromBlob(blob);
     }
 
     /**
@@ -134,7 +176,11 @@ export class RawImage {
      * @returns {Promise<RawImage>} The image object.
      */
     static async fromBlob(blob) {
-        if (BROWSER_ENV) {
+        if (IS_REACT_NATIVE) {
+            const buffer = await blob.arrayBuffer();
+            const { data, width, height } = decode(buffer);
+            return new RawImage(new Uint8ClampedArray(data), width, height, 4);
+        } else if (BROWSER_ENV) {
             // Running in environment with canvas
             let img = await loadImageFunction(blob);
 
@@ -263,7 +309,39 @@ export class RawImage {
         // Ensure resample method is a string
         let resampleMethod = RESAMPLING_MAPPING[resample] ?? resample;
 
-        if (BROWSER_ENV) {
+        if (IS_REACT_NATIVE) {
+            if (createCanvasFunction !== undefined && env.useGCanvas) {
+                // Running in environment with canvas
+                let canvas = createCanvasFunction(this.width, this.height);
+                let ctx = canvas.getContext('2d');
+                let imageData = this.toImageData();
+                ctx.putImageData(imageData, 0, 0);
+                ctx.drawImage(canvas, 0, 0, this.width, this.height, 0, 0, width, height);
+                let newImageData = ctx.getImageData(0, 0, width, height);
+                const resized = new RawImage(newImageData.data, width, height, 4);
+                return resized.convert(this.channels);
+            } else {
+                // Running in environment without canvas
+                // WHC -> CHW
+                const [trsnsposed] = transpose_data(
+                    this.data,
+                    [this.width, this.height, this.channels],
+                    [2, 0, 1]
+                );
+                const resized = interpolate_data(
+                    trsnsposed,
+                    [this.channels, this.height, this.width],
+                    [height, width]
+                );
+                // CHW -> WHC
+                const [newData] = transpose_data(
+                    resized,
+                    [this.channels, height, width],
+                    [1, 2, 0]
+                );
+                return new RawImage(newData, width, height, this.channels);
+            }
+        } else if (BROWSER_ENV) {
             // TODO use `resample` in browser environment
 
             // Store number of channels before resizing
@@ -336,7 +414,37 @@ export class RawImage {
             return this;
         }
 
-        if (BROWSER_ENV) {
+        if (IS_REACT_NATIVE) {
+            if (createCanvasFunction !== undefined && env.useGCanvas) {
+                // Running in environment with canvas
+                let newWidth = this.width + left + right;
+                let newHeight = this.height + top + bottom;
+                let canvas = createCanvasFunction(newWidth, newHeight);
+                let ctx = canvas.getContext('2d');
+                let imageData = this.toImageData();
+                ctx.putImageData(imageData, left, top);
+                let newImageData = ctx.getImageData(0, 0, newWidth, newHeight);
+                const padded = new RawImage(newImageData.data, newWidth, newHeight, 4);
+                return padded.convert(this.channels);
+            } else {
+                // Running in environment without canvas
+                const channels = this.channels;
+                const data = this.data;
+                const width = this.width + left + right;
+                const height = this.height + top + bottom;
+                const paddedData = new Uint8ClampedArray(width * height * channels);
+                for (let i = 0; i < data.length; i += channels) {
+                    const x = Math.floor(i / channels) % this.width;
+                    const y = Math.floor(i / channels / this.width);
+                    const pixelIndex = (y * width + x) * channels;
+                    for (let j = 0; j < channels; j++) {
+                        paddedData[pixelIndex + j] = data[i + j];
+                    }
+                }
+                return new RawImage(paddedData, width, height, channels);
+            }
+
+        } else if (BROWSER_ENV) {
             // Store number of channels before padding
             let numChannels = this.channels;
 
@@ -379,8 +487,32 @@ export class RawImage {
         let width_offset = (this.width - crop_width) / 2;
         let height_offset = (this.height - crop_height) / 2;
 
-
-        if (BROWSER_ENV) {
+        if (IS_REACT_NATIVE) {
+            if (createCanvasFunction !== undefined && env.useGCanvas) {
+                // Running in environment with canvas
+                let canvas = createCanvasFunction(crop_width, crop_height);
+                let ctx = canvas.getContext('2d');
+                let imageData = this.toImageData();
+                ctx.putImageData(imageData, -width_offset, -height_offset);
+                let newImageData = ctx.getImageData(0, 0, crop_width, crop_height);
+                const cropped = new RawImage(newImageData.data, crop_width, crop_height, 4);
+                return cropped.convert(this.channels);
+            } else {
+                // Running in environment without canvas
+                let channels = this.channels;
+                let data = this.data;
+                let croppedData = new Uint8ClampedArray(crop_width * crop_height * channels);
+                for (let i = 0; i < croppedData.length; i += channels) {
+                    const x = Math.floor(i / channels) % crop_width;
+                    const y = Math.floor(i / channels / crop_width);
+                    const pixelIndex = ((y + height_offset) * this.width + (x + width_offset)) * channels;
+                    for (let j = 0; j < channels; j++) {
+                        croppedData[i + j] = data[pixelIndex + j];
+                    }
+                }
+                return new RawImage(croppedData, crop_width, crop_height, channels);
+            }
+        } else if (BROWSER_ENV) {
             // Store number of channels before resizing
             let numChannels = this.channels;
 
@@ -484,8 +616,18 @@ export class RawImage {
         }
     }
 
+    toImageData() {
+        if (IS_REACT_NATIVE && ImageDataClass === undefined)
+            throw new Error('toImageData is not supported');
+        // Clone, and convert data to RGBA before create ImageData object.
+        // This is because the ImageData API only supports RGBA
+        let cloned = this.clone().rgba();
+
+        return new ImageDataClass(cloned.data, cloned.width, cloned.height);
+    }
+
     toCanvas() {
-        if (!BROWSER_ENV) {
+        if (!createCanvasFunction) {
             throw new Error('toCanvas() is only supported in browser environments.')
         }
 
@@ -557,8 +699,13 @@ export class RawImage {
      * @param {string} path The path to save the image to.
      */
     save(path) {
+        const extension = path.split('.').pop().toLowerCase();
+        const mime = this._CONTENT_TYPE_MAP[extension] ?? 'image/png';
 
-        if (BROWSER_ENV) {
+        if (IS_REACT_NATIVE) {
+            const buf = Buffer.from(encode(this.rgba().data, mime));
+            fs.writeFile(path, buf.toString('base64'), 'base64');
+        } else if (BROWSER_ENV) {
             const extension = path.split('.').pop().toLowerCase();
             const mime = this._CONTENT_TYPE_MAP[extension] ?? 'image/png';
 
